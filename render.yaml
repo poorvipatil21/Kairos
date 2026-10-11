@@ -1,0 +1,8 @@
+# One-click deploy on Render: New > Blueprint > pick this repo.
+services:
+  - type: web
+    name: kairos
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/symbols
+    autoDeploy: true

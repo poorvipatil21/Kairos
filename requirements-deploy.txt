@@ -1,0 +1,11 @@
+# Kairos runtime dependencies (used by the Dockerfile).
+# If your engine (main.py, strategies/, db/) imports anything else, add it here.
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.0
+yfinance>=0.2.40
+pandas>=2.1
+numpy>=1.26
+pybind11>=2.12
+# optional: exact Engle-Granger p-values for pairs (falls back to critical values without it)
+statsmodels>=0.14
