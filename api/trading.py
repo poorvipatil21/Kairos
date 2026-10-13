@@ -3,6 +3,7 @@ import os
 import sqlite3
 import threading
 import time
+import math
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB = os.environ.get("STRATLAB_PAPER_DB", os.path.join(ROOT, "paper.db"))
@@ -30,6 +31,35 @@ def init():
         """)
         for m, cash in START_CASH.items():
             c.execute("INSERT OR IGNORE INTO accounts VALUES(?,?,?,?)", (m, cash, cash, time.time()))
+        # repair rows written with a blank (NaN) Yahoo price, which SQLite stores as NULL
+        bad = c.execute("SELECT COUNT(*) FROM orders WHERE price IS NULL OR value IS NULL OR qty IS NULL").fetchone()[0]
+        bad += c.execute("SELECT COUNT(*) FROM positions WHERE qty IS NULL OR avg_price IS NULL").fetchone()[0]
+        bad += c.execute("SELECT COUNT(*) FROM accounts WHERE cash IS NULL OR start_cash IS NULL").fetchone()[0]
+        if bad:
+            c.execute("DELETE FROM orders WHERE price IS NULL OR value IS NULL OR qty IS NULL")
+            c.execute("DELETE FROM equity_snap WHERE equity IS NULL")
+            for m in START_CASH:
+                _rebuild(c, m)
+
+
+def _rebuild(c, m):
+    """Recompute cash and positions for one market by replaying its valid orders."""
+    start = c.execute("SELECT start_cash FROM accounts WHERE mkt=?", (m,)).fetchone()[0] or START_CASH[m]
+    cash, pos = start, {}
+    for sym, side, qty, px in c.execute("SELECT symbol, side, qty, price FROM orders WHERE mkt=? ORDER BY id", (m,)).fetchall():
+        q0, a0 = pos.get(sym, (0.0, 0.0))
+        if side == "BUY":
+            nq = q0 + qty
+            pos[sym] = (nq, (q0 * a0 + qty * px) / nq)
+            cash -= qty * px
+        else:
+            pos[sym] = (max(q0 - qty, 0.0), a0)
+            cash += qty * px
+    c.execute("DELETE FROM positions WHERE mkt=?", (m,))
+    for sym, (q, a) in pos.items():
+        if q > 1e-9:
+            c.execute("INSERT INTO positions VALUES(?,?,?,?)", (m, sym, q, a))
+    c.execute("UPDATE accounts SET cash=?, start_cash=? WHERE mkt=?", (cash, start, m))
 
 
 def mkt_of(symbol):
@@ -46,7 +76,7 @@ def account(mkt, quote_fn):
     mv = 0.0
     for p in pos:
         q = quote_fn(p["symbol"])
-        last = q["price"] if q else p["avg_price"]
+        last = q["price"] if q and q.get("price") is not None and math.isfinite(q["price"]) else p["avg_price"]
         p["last"] = last
         p["change"] = q["change"] if q else 0.0
         p["value"] = last * p["qty"]
@@ -80,6 +110,8 @@ def place_order(symbol, side, qty, quote_fn):
     if not q:
         return {"ok": False, "error": f"no live price for {symbol}"}
     px = float(q["price"])
+    if not math.isfinite(px) or px <= 0:
+        return {"ok": False, "error": f"Yahoo has no valid price for {symbol} right now, try again in a minute"}
     mkt = mkt_of(symbol)
     val = px * qty
     with _lock, _conn() as c:

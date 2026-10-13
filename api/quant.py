@@ -608,6 +608,8 @@ def pairs_backtest(dates, p1, p2, entry=2.0, exit_=0.5, window=30, cost_bps=5.0,
 
 # ════════════════════════════════════════════════════════════ portfolio optimisation
 def _proj_simplex(v):
+    if not np.all(np.isfinite(v)):
+        raise FloatingPointError("non-finite weights in simplex projection")
     u = np.sort(v)[::-1]
     css = np.cumsum(u)
     rho = np.nonzero(u * np.arange(1, len(v) + 1) > (css - 1))[0][-1]
@@ -635,10 +637,10 @@ def _max_sharpe(mu, cov, w0, iters=4000):
         g = mu / v - (w @ mu) * (cov @ w) / v ** 3
         nw = _proj_simplex(w + step * g)
         ns = S(nw)
-        if ns >= cur:
+        if ns > cur + 1e-12:          # real improvement: keep it and try a slightly bigger step
             w, cur = nw, ns
-            step *= 1.1
-        else:
+            step = min(step * 1.1, 10.0)
+        else:                         # no gain (e.g. stuck at a corner like 100% one stock): shrink
             step *= 0.5
             if step < 1e-9:
                 break

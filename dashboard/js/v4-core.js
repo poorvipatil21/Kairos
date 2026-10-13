@@ -251,31 +251,51 @@ async function loadScreener(force) {
     scrRender();
   } catch { document.getElementById('scr-table').innerHTML = '<tr><td class="note">Screener unavailable</td></tr>'; }
 }
+const SCR_PRESETS = {
+  all: ['All', () => true], oversold: ['Oversold (RSI<30)', r => r.rsi < 30], overbought: ['Overbought (RSI>70)', r => r.rsi > 70],
+  highs: ['Near 52W high', r => r.from_high > -5], lows: ['Near 52W low', r => r.from_low < 5],
+  trend: ['Above 50 & 200 DMA', r => r.above_sma50 && r.above_sma200], value: ['Value (P/E<15)', r => r.pe != null && r.pe > 0 && r.pe < 15],
+  momentum: ['Momentum (3M>10%)', r => (r.chg3m || 0) > 10],
+};
 function scrPreset(k, el) {
   scrP = k;
   document.querySelectorAll('#scr-presets .chip').forEach(c => c.classList.remove('active'));
   el.classList.add('active'); scrRender();
 }
-function scrPass(r) {
-  const v = id => { const x = document.getElementById(id).value; return x === '' ? null : parseFloat(x); };
-  const presets = {
-    all: () => true, oversold: r => r.rsi < 30, overbought: r => r.rsi > 70,
-    highs: r => r.from_high > -5, lows: r => r.from_low < 5,
-    trend: r => r.above_sma50 && r.above_sma200, value: r => r.pe != null && r.pe > 0 && r.pe < 15,
-    momentum: r => (r.chg3m || 0) > 10,
-  };
-  if (!presets[scrP](r)) return false;
+/** Every active filter as {label, fn}, so an empty result can say which one is the blocker. */
+function scrFilters() {
+  const v = id => { const x = document.getElementById(id).value.trim(); return x === '' || isNaN(parseFloat(x)) ? null : parseFloat(x); };
+  const f = [];
+  if (scrP !== 'all') f.push({ label: SCR_PRESETS[scrP][0], fn: SCR_PRESETS[scrP][1] });
   const sec = document.getElementById('scr-sector').value;
-  if (sec && r.sector !== sec) return false;
+  if (sec) f.push({ label: `Sector: ${sec}`, fn: r => r.sector === sec });
   const rmin = v('scr-rsi-min'), rmax = v('scr-rsi-max'), pe = v('scr-pe-max'), m1 = v('scr-1m-min'), hi = v('scr-high');
-  if (rmin != null && !(r.rsi >= rmin)) return false;
-  if (rmax != null && !(r.rsi <= rmax)) return false;
-  if (pe != null && !(r.pe != null && r.pe <= pe)) return false;
-  if (m1 != null && !((r.chg1m ?? -1e9) >= m1)) return false;
-  if (hi != null && !(-r.from_high <= hi)) return false;
+  if (rmin != null) f.push({ label: `RSI ≥ ${rmin}`, fn: r => r.rsi >= rmin });
+  if (rmax != null) f.push({ label: `RSI ≤ ${rmax}`, fn: r => r.rsi <= rmax });
+  if (pe != null) f.push({ label: `P/E ≤ ${pe}`, fn: r => r.pe != null && r.pe > 0 && r.pe <= pe });
+  if (m1 != null) f.push({ label: `1M change ≥ ${m1}%`, fn: r => (r.chg1m ?? -1e9) >= m1 });
+  if (hi != null) { const h = Math.abs(hi); f.push({ label: `Within ${h}% of 52W high`, fn: r => -r.from_high <= h }); }
   const q = document.getElementById('scr-q').value.trim().toLowerCase();
-  if (q && !(r.symbol.toLowerCase().includes(q) || (r.name || '').toLowerCase().includes(q))) return false;
-  return true;
+  if (q) f.push({ label: `Search "${q}"`, fn: r => r.symbol.toLowerCase().includes(q) || (r.name || '').toLowerCase().includes(q) });
+  return f;
+}
+function scrPass(r) { return scrFilters().every(x => x.fn(r)); }
+function scrReset() {
+  ['scr-rsi-min', 'scr-rsi-max', 'scr-pe-max', 'scr-1m-min', 'scr-high', 'scr-q'].forEach(id => { document.getElementById(id).value = ''; });
+  document.getElementById('scr-sector').value = '';
+  scrP = 'all';
+  document.querySelectorAll('#scr-presets .chip').forEach((c, i) => c.classList.toggle('active', i === 0));
+  scrRender();
+}
+function scrEmptyHelp() {
+  const f = scrFilters();
+  if (!f.length) return 'No data for this market yet.';
+  const alone = f.map(x => ({ label: x.label, n: SCR.filter(x.fn).length }));
+  const zero = alone.filter(x => x.n === 0);
+  let msg = '<b>No stocks match all ' + f.length + ' filters together.</b> ';
+  if (zero.length) msg += 'These match nothing even on their own: ' + zero.map(x => `<b>${esc(x.label)}</b>`).join(', ') + '. ';
+  msg += 'On its own, each filter keeps: ' + alone.map(x => `${esc(x.label)} → ${x.n}`).join(' · ') + '.';
+  return msg + ` <a href="#" class="ext-link" onclick="scrReset();return false">Reset filters</a>`;
 }
 function scrSortBy(k) { scrSort = { k, d: scrSort.k === k ? -scrSort.d : -1 }; scrRender(); }
 function scrRows() {
@@ -288,7 +308,8 @@ function scrRows() {
 }
 function scrRender() {
   const rows = scrRows();
-  document.getElementById('scr-count').textContent = `${rows.length} of ${SCR.length} stocks`;
+  const nf_ = scrFilters().length;
+  document.getElementById('scr-count').innerHTML = `${rows.length} of ${SCR.length} stocks` + (nf_ ? ` · ${nf_} filter${nf_ > 1 ? 's' : ''} · <a href="#" class="ext-link" onclick="scrReset();return false">reset</a>` : '');
   const pc = v => v == null ? '—' : `<span class="${cls(v)}">${v >= 0 ? '+' : ''}${v.toFixed(1)}%</span>`;
   const head = '<tr>' + SCR_COLS.map(([k, l]) => `<th class="sortable ${scrSort.k === k ? 'sorted' : ''} ${k === 'name' || k === 'sector' ? 'l' : ''}" onclick="scrSortBy('${k}')">${l}${scrSort.k === k ? (scrSort.d > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('') + '</tr>';
   const body = rows.map(r => `<tr class="click" onclick="openSymbol('${r.symbol}')">
@@ -299,7 +320,7 @@ function scrRender() {
     <td>${r.from_high.toFixed(1)}%</td>
     <td>${r.above_sma200 == null ? '—' : r.above_sma50 && r.above_sma200 ? '<span class="pill g">UP</span>' : !r.above_sma50 && !r.above_sma200 ? '<span class="pill r">DOWN</span>' : '<span class="pill" style="color:var(--gold)">MIXED</span>'}</td>
     <td>${r.vol.toFixed(0)}%</td><td>${r.pe != null ? r.pe.toFixed(1) : '—'}</td><td>${fmtCap(r.mcap, mktOf(r.symbol))}</td></tr>`).join('');
-  document.getElementById('scr-table').innerHTML = head + (body || `<tr><td colspan="${SCR_COLS.length}" class="note">No stocks match these filters</td></tr>`);
+  document.getElementById('scr-table').innerHTML = head + (body || `<tr><td colspan="${SCR_COLS.length}" class="l note" style="white-space:normal;line-height:1.7;padding:14px 10px">${scrEmptyHelp()}</td></tr>`);
 }
 function scrExport() {
   const rows = scrRows(); if (!rows.length) return;

@@ -21,36 +21,96 @@ try:
 except ImportError:
     load_history = None
 
-def _fix_metrics(r):
-    """Recompute Sharpe and max drawdown from the stored equity curve so every
-    strategy gets its own correct values (the engine was writing one shared Sharpe)."""
-    eq = r.get("equity")
-    if isinstance(eq, str):
-        try: eq = json.loads(eq); r["equity"] = eq
-        except Exception: eq = None
-    if not eq or len(eq) < 3:
-        return r
-    vals = np.array([e[1] if isinstance(e, (list, tuple)) else e for e in eq], dtype=float)
-    vals = vals[vals > 0]
-    if len(vals) < 3:
-        return r
-    rets = np.diff(vals) / vals[:-1]
-    sd = rets.std(ddof=1)
-    r["sharpe_engine"] = r.get("sharpe")
-    r["sharpe"] = float(rets.mean() / sd * np.sqrt(252)) if sd > 0 else 0.0
-    peak = np.maximum.accumulate(vals)
-    r["max_dd"] = float(((peak - vals) / peak).max())
-    return r
+def _fix_metrics(rows):
+    """The DB stores curves as equity_json / trades_json strings: expose them as the
+    equity / trades lists the dashboard reads. The engine's Sharpe uses the full curve,
+    so it is kept and only recomputed if it is missing or identical for every strategy."""
+    out = []
+    for r in rows:
+        r = dict(r)
+        for src, dst in (("equity_json", "equity"), ("trades_json", "trades")):
+            v = r.get(dst, r.get(src))
+            if isinstance(v, str):
+                try: v = json.loads(v)
+                except Exception: v = []
+            r[dst] = v or []
+            r.pop(src, None)
+        out.append(r)
+    sharpes = [r.get("sharpe") for r in out if r.get("sharpe") is not None]
+    same = len(out) > 2 and len({round(float(s), 6) for s in sharpes}) == 1
+    for r in out:
+        s = r.get("sharpe")
+        if s is None or not np.isfinite(float(s)) or same:
+            vals = np.array([e[1] if isinstance(e, (list, tuple)) else e for e in r["equity"]], dtype=float)
+            vals = vals[np.isfinite(vals) & (vals > 0)]
+            if len(vals) > 2:
+                rets = np.diff(vals) / vals[:-1]
+                sd = rets.std(ddof=1)
+                r["sharpe"] = float(rets.mean() / sd * np.sqrt(252)) if sd > 0 else 0.0
+    return out
 
 def get_all_results():
     rows = load_latest()
     if isinstance(rows, dict):
         rows = list(rows.values())
-    rows = [_fix_metrics(dict(r)) for r in (rows or [])]
-    return sorted(rows, key=lambda x: x.get("sharpe", 0), reverse=True)
+    rows = [dict(r) for r in (rows or [])]
+    # running main.py twice on the same day saves two sets of rows: keep the newest per strategy
+    newest = {}
+    for r in rows:
+        k = r.get("strategy")
+        if k not in newest or (r.get("id") or 0) > (newest[k].get("id") or 0):
+            newest[k] = r
+    rows = _fix_metrics(list(newest.values()))
+    return sorted(rows, key=lambda x: x.get("sharpe") or 0, reverse=True)
 
 app = FastAPI(title="Kairos API")
 T.init()
+
+# ── Clean every Yahoo price table once, here: drop blank (NaN) placeholder rows that
+#    Yahoo adds for today before the open, and duplicate bars for the same date.
+_yf_history = yf.Ticker.history
+def _history_dedup(self, *args, **kwargs):
+    h = _yf_history(self, *args, **kwargs)
+    try:
+        if h is not None and not h.empty and "Close" in h.columns:
+            h = h[h["Close"].notna() & (h["Close"] > 0)]
+            if "Volume" in h.columns:
+                h = h.assign(Volume=h["Volume"].fillna(0))
+        interval = kwargs.get("interval", "1d")
+        if h is not None and not h.empty and not interval.endswith(("m", "h")):
+            h = h[~h.index.normalize().duplicated(keep="last")]
+    except Exception:
+        pass
+    return h
+yf.Ticker.history = _history_dedup
+
+# ── Any unhandled error comes back as JSON {"error": ...} so the page can show it,
+#    and the full traceback is printed in the server terminal.
+import traceback, math
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def _json_errors(request: Request, exc: Exception):
+    traceback.print_exc()
+    return JSONResponse(status_code=500, content={"error": f"{type(exc).__name__}: {exc}"})
+
+# ── One NaN anywhere used to crash a whole response. Send NaN/inf as null instead.
+def _nan_to_none(o):
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _nan_to_none(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_nan_to_none(v) for v in o]
+    return o
+
+class SafeJSONResponse(JSONResponse):
+    def render(self, content):
+        return json.dumps(_nan_to_none(content), ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+
+app.router.default_response_class = SafeJSONResponse
+# ── end of data-cleaning block
 _DASH_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dashboard")
 app.mount("/static", StaticFiles(directory=_DASH_DIR), name="static")
 

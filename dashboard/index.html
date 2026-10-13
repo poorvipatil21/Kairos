@@ -599,7 +599,7 @@ footer{border-top:1px solid var(--border);padding:20px 28px;
       <div class="fld"><label>RSI min / max</label><div class="row2"><input class="inp mono" id="scr-rsi-min" type="number" placeholder="0" oninput="scrRender()"><input class="inp mono" id="scr-rsi-max" type="number" placeholder="100" oninput="scrRender()"></div></div>
       <div class="fld"><label>P/E max</label><input class="inp mono" id="scr-pe-max" type="number" placeholder="any" oninput="scrRender()"></div>
       <div class="fld"><label>1M change min %</label><input class="inp mono" id="scr-1m-min" type="number" placeholder="any" oninput="scrRender()"></div>
-      <div class="fld"><label>Max % below 52W high</label><input class="inp mono" id="scr-high" type="number" placeholder="any" oninput="scrRender()"></div>
+      <div class="fld"><label>Within % of 52W high</label><input class="inp mono" id="scr-high" type="number" min="0" placeholder="e.g. 10" oninput="scrRender()"></div>
       <div class="fld"><label>Search</label><input class="inp" id="scr-q" placeholder="symbol or name" oninput="scrRender()"></div>
     </div>
   </div>
@@ -802,14 +802,21 @@ footer{border-top:1px solid var(--border);padding:20px 28px;
   <div class="portfolio-layout">
     <div class="portfolio-controls">
       <h3>Build Portfolio</h3>
+      <div class="sec-lbl" style="margin-bottom:6px">Starter baskets</div>
+      <div class="chip-row" id="pf-baskets" style="margin-bottom:12px"></div>
       <div id="pf-holdings"></div>
       <div class="pf-input-row">
-        <select class="pf-select" id="pf-sym-select"></select>
-        <input class="pf-weight" type="number" id="pf-weight-input" value="20" min="1" max="100">
+        <input class="pf-select inp mono" id="pf-sym-input" list="sym-all" placeholder="symbol, e.g. TCS or AAPL" onkeydown="if(event.key==='Enter')pfAddHolding()">
+        <input class="pf-weight" type="number" id="pf-weight-input" value="20" min="1" max="100" title="Weight %" onkeydown="if(event.key==='Enter')pfAddHolding()">
       </div>
-      <button class="pf-add-btn" onclick="pfAddHolding()">+ Add</button>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="pf-add-btn" onclick="pfAddHolding()">+ Add</button>
+        <button class="pf-add-btn" onclick="pfEqualize()" title="Give every stock the same weight">⚖ Equal weights</button>
+        <button class="pf-add-btn" onclick="pfClear()">Clear</button>
+      </div>
       <div class="pf-total" id="pf-total-weight">Total: 0%</div>
       <button class="pf-run-btn" onclick="pfRun()">▶ Simulate</button>
+      <div class="note" style="margin-top:10px">Weights are rescaled to 100% automatically. Indian and US stocks can be mixed; prices are matched by date.</div>
     </div>
     <div class="portfolio-chart-panel">
       <div class="panel-header">
@@ -1445,7 +1452,7 @@ async function loadStockChart(sym) {
     ]);
     window._lastPriceData = data;
     if (typeof loadCompareData==='function') await loadCompareData();
-    if (!data.length) return;
+    if (!Array.isArray(data) || !data.length) { document.getElementById('exp-sub').textContent='No price data from Yahoo right now. Try again in a minute.'; return; }
     const last=data[data.length-1], prev=data[data.length-2]||data[0];
     const chg=((last.close-prev.close)/prev.close)*100;
     _symData[sym]={chg};
@@ -1520,47 +1527,83 @@ async function loadHeatmap() {
 }
 
 /* ══════════════════════════════════════ PORTFOLIO */
-function populatePfSelect() {
-  const syms = ALL_SYMS.length ? ALL_SYMS : [];
-  document.getElementById('pf-sym-select').innerHTML=syms.map(s=>`<option value="${s}">${s.replace('.NS','')}</option>`).join('');
+const PF_BASKETS = {
+  india: { 'Nifty top 5': ['RELIANCE.NS','TCS.NS','HDFCBANK.NS','INFY.NS','ICICIBANK.NS'],
+           'Banks': ['HDFCBANK.NS','ICICIBANK.NS','SBIN.NS','KOTAKBANK.NS','AXISBANK.NS'],
+           'IT': ['TCS.NS','INFY.NS','WIPRO.NS','HCLTECH.NS','TECHM.NS'],
+           'Defensive': ['HINDUNILVR.NS','ITC.NS','NESTLEIND.NS','SUNPHARMA.NS','POWERGRID.NS'] },
+  usa:   { 'Mega cap 5': ['AAPL','MSFT','GOOGL','AMZN','NVDA'],
+           'Banks': ['JPM','BAC','WFC','GS','MS'],
+           'Healthcare': ['UNH','JNJ','LLY','ABBV','MRK'],
+           'Defensive': ['PG','JNJ','XOM','CVX','VZ'] },
+};
+function populatePfSelect() {   // called on load and on market switch: show that market's starter baskets
+  const el = document.getElementById('pf-baskets'); if (!el) return;
+  el.innerHTML = Object.keys(PF_BASKETS[MARKET] || {}).map(k => `<div class="chip" onclick="pfBasket('${k}')">${k}</div>`).join('');
+  if (!pfHoldings.length) renderPfHoldings();
+}
+function pfBasket(k) {
+  const syms = PF_BASKETS[MARKET][k];
+  pfHoldings = syms.map(sym => ({ sym, wt: Math.round(1000 / syms.length) / 10 }));
+  renderPfHoldings(); pfRun();
 }
 function pfAddHolding() {
-  const sym=document.getElementById('pf-sym-select').value;
-  const wt=parseFloat(document.getElementById('pf-weight-input').value)||10;
-  if(!sym) return;
-  pfHoldings.push({sym,wt});
+  const inp = document.getElementById('pf-sym-input');
+  const sym = normSym(inp.value);
+  if (!sym) { toast('Portfolio', 'Type a symbol first, for example TCS or AAPL', 'warn'); inp.focus(); return false; }
+  if (pfHoldings.some(h => h.sym === sym)) { toast('Portfolio', shortSym(sym) + ' is already in the portfolio', 'warn'); return false; }
+  const wt = parseFloat(document.getElementById('pf-weight-input').value) || 10;
+  pfHoldings.push({ sym, wt });
+  inp.value = ''; inp.focus();
   renderPfHoldings();
+  return true;
 }
+function pfEqualize() { if (!pfHoldings.length) return; const w = Math.round(1000 / pfHoldings.length) / 10; pfHoldings.forEach(h => h.wt = w); renderPfHoldings(); }
+function pfClear() { pfHoldings = []; renderPfHoldings(); document.getElementById('pf-metrics').innerHTML = ''; document.getElementById('pf-opt').style.display = 'none'; }
+function pfSetW(i, v) { const w = parseFloat(v); if (w > 0) { pfHoldings[i].wt = w; renderPfHoldings(); } }
 function pfRemove(i){ pfHoldings.splice(i,1); renderPfHoldings(); }
 function renderPfHoldings() {
-  const total=pfHoldings.reduce((a,h)=>a+h.wt,0);
-  document.getElementById('pf-holdings').innerHTML=pfHoldings.map((h,i)=>`
+  const total = pfHoldings.reduce((a, h) => a + h.wt, 0);
+  document.getElementById('pf-holdings').innerHTML = pfHoldings.length ? pfHoldings.map((h, i) => `
     <div class="pf-holding">
-      <span>${h.sym.replace('.NS','')}</span>
-      <span style="color:var(--muted)">${h.wt}%</span>
-      <button class="pf-remove" onclick="pfRemove(${i})">✕</button>
-    </div>`).join('');
-  document.getElementById('pf-total-weight').textContent=`Total: ${Math.round(total*10)/10}%`;
+      <span>${FLAG(mktOf(h.sym))}${shortSym(h.sym)}</span>
+      <span style="display:flex;align-items:center;gap:4px"><input type="number" value="${h.wt}" min="0.1" step="0.1" onchange="pfSetW(${i},this.value)"
+        style="width:54px;background:#0a131e;border:1px solid var(--border2);border-radius:4px;color:var(--text);font-family:var(--mono);font-size:.7rem;padding:2px 4px;text-align:right">
+        <span style="color:var(--muted);font-size:.66rem;width:42px;text-align:right">${total ? (h.wt / total * 100).toFixed(0) : 0}%</span></span>
+      <button class="pf-remove" onclick="pfRemove(${i})" title="Remove">✕</button>
+    </div>`).join('') : '<div class="note" style="margin-bottom:10px">No stocks yet. Pick a starter basket above, or type a symbol below and press Enter.</div>';
+  document.getElementById('pf-total-weight').textContent = pfHoldings.length ? `${pfHoldings.length} stock${pfHoldings.length > 1 ? 's' : ''} · weights add to ${Math.round(total * 10) / 10}% (rescaled to 100%)` : '';
+  const svg = document.getElementById('pf-chart-svg');
+  if (!pfHoldings.length && svg) { svg.setAttribute('viewBox', '0 0 800 280'); svg.innerHTML = '<text x="400" y="140" fill="var(--muted)" text-anchor="middle" font-size="13" font-family="IBM Plex Mono">Add stocks on the left, then press Simulate</text>'; }
 }
 async function pfRun() {
-  if (!pfHoldings.length) return;
-  const svg=document.getElementById('pf-chart-svg');
-  svg.innerHTML='<text x="50%" y="140" fill="var(--muted)" text-anchor="middle" font-size="12" font-family="IBM Plex Mono">Loading…</text>';
+  if (!pfHoldings.length) {
+    if (document.getElementById('pf-sym-input').value.trim()) { if (!pfAddHolding()) return; }
+    else { toast('Portfolio', 'Add at least one stock, or pick a starter basket', 'warn'); return; }
+  }
+  const svg = document.getElementById('pf-chart-svg');
+  svg.setAttribute('viewBox', '0 0 800 280');
+  svg.innerHTML = '<text x="400" y="140" fill="var(--muted)" text-anchor="middle" font-size="12" font-family="IBM Plex Mono">Loading prices…</text>';
   try {
-    const results=await Promise.all(pfHoldings.map(h=>fetch(`/api/stock/${h.sym}?period=1y`).then(r=>r.json())));
-    const minLen=Math.min(...results.map(r=>r.length));
-    const trimmed=results.map(r=>r.slice(-minLen));
-    const totW=pfHoldings.reduce((a,h)=>a+h.wt,0)||1;
-    const weights=pfHoldings.map(h=>h.wt/totW);
-    const port=trimmed[0].map((_,day)=>{
-      let v=0;
-      trimmed.forEach((r,si)=>{ v+=weights[si]*(r[day].close/r[0].close); });
-      return v*100000;
-    });
-    const bh=trimmed[0].map(d=>(d.close/trimmed[0][0].close)*100000);
-    const dates=trimmed[0].map(d=>d.date);
+    const results = await Promise.all(pfHoldings.map(h => fetch(`/api/stock/${encodeURIComponent(h.sym)}?period=1y`).then(r => r.json()).catch(() => [])));
+    const bad = pfHoldings.filter((h, i) => !Array.isArray(results[i]) || results[i].length < 2);
+    if (bad.length) {
+      toast('Portfolio', 'No price data for ' + bad.map(h => shortSym(h.sym)).join(', ') + '. Check the symbol.', 'err');
+      svg.innerHTML = '<text x="400" y="140" fill="var(--red)" text-anchor="middle" font-size="12" font-family="IBM Plex Mono">Missing prices for ' + bad.map(h => shortSym(h.sym)).join(', ') + '</text>';
+      return;
+    }
+    const maps = results.map(r => new Map(r.map(d => [d.date, d.close])));
+    const dates = results[0].map(d => d.date).filter(dt => maps.every(m => m.has(dt)));
+    if (dates.length < 2) { svg.innerHTML = '<text x="400" y="140" fill="var(--red)" text-anchor="middle" font-size="12" font-family="IBM Plex Mono">These stocks share no trading dates</text>'; return; }
+    const series = maps.map(m => dates.map(dt => m.get(dt)));
+    const totW = pfHoldings.reduce((a, h) => a + h.wt, 0) || 1;
+    const weights = pfHoldings.map(h => h.wt / totW);
+    const port = dates.map((_, d) => 100000 * series.reduce((v, c, i) => v + weights[i] * c[d] / c[0], 0));
+    const bh = dates.map((_, d) => 100000 * series.reduce((v, c) => v + c[d] / c[0], 0) / series.length);
     drawPfChart(port, bh, dates);
-  } catch {}
+  } catch (e) {
+    svg.innerHTML = '<text x="400" y="140" fill="var(--red)" text-anchor="middle" font-size="12" font-family="IBM Plex Mono">Could not load prices</text>';
+  }
 }
 function drawPfChart(port, bh, dates) {
   const svg=document.getElementById('pf-chart-svg');
